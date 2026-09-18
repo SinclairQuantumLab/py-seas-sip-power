@@ -1,0 +1,4 @@
+# SIP POWER UDP endpoint for demo.ipynb.
+host = "<HOST>"
+# port = 2527
+timeout_s = 3
