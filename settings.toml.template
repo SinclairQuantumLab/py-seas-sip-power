@@ -1,4 +1,14 @@
-# SIP POWER UDP endpoint for demo.ipynb.
+# Optional legacy configuration reference for consuming applications.
+# The library and demo do not load this file. The demo uses inline identifier
+# and ConnectionTypeEnum values; access mode is chosen in the client constructor.
 host = "<HOST>"
 # port = 2527
 timeout_s = 3
+
+# Optional values for applications that choose to load their own configuration:
+# modbus_tcp_port = 502
+# modbus_id = 11
+# serial_port = "<SERIAL_PORT>"
+# baudrate = 38400
+# udp_broadcast_host = "<BROADCAST_HOST>"
+# rtu_broadcast_ids = [11]

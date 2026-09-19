@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import struct
+import subprocess
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
+import nbformat
 import pytest
 
-import seas_sip_client as source_module
 from seas_sip_client import (
     READ_ALL_REQUEST,
+    AccessModeEnum,
     SAESSIPPowerClient,
     SAESSIPPowerCommunicationError,
     SAESSIPPowerProtocolError,
@@ -197,9 +197,7 @@ def test_parse_read_all_response_rejects_naive_timestamp() -> None:
     """Require timezone-aware acquisition timestamps at the source boundary."""
 
     with pytest.raises(SAESSIPPowerProtocolError, match="timezone-aware"):
-        parse_read_all_response(
-            read_all_response(), observed_at=datetime(2026, 8, 28)
-        )
+        parse_read_all_response(read_all_response(), observed_at=datetime(2026, 8, 28))
 
 
 def test_client_reads_documented_request_and_closes_idempotently() -> None:
@@ -235,13 +233,19 @@ def test_client_translates_receive_timeout_without_raw_frame_logging() -> None:
         client.read_sample()
 
 
-@pytest.mark.parametrize(("method", "command"), [("start", b"\x01\x01"), ("stop", b"\x01\x02")])
-def test_control_sends_once_without_waiting_for_ack(method: str, command: bytes) -> None:
+@pytest.mark.parametrize(
+    ("method", "command"), [("start", b"\x01\x01"), ("stop", b"\x01\x02")]
+)
+def test_control_sends_once_without_waiting_for_ack(
+    method: str, command: bytes
+) -> None:
     """Send the exact command and leave readback explicitly to the caller."""
 
     fake_socket = FakeSocket([read_all_response()])
     client = SAESSIPPowerClient(
-        SAESSIPPowerSettings("controller"), socket_factory=lambda: fake_socket
+        SAESSIPPowerSettings("controller"),
+        access_mode=AccessModeEnum.READ_WRITE,
+        socket_factory=lambda: fake_socket,
     )
     client.connect()
     getattr(client, method)()
@@ -257,7 +261,9 @@ def test_control_sends_once_without_waiting_for_ack(method: str, command: bytes)
 def test_control_requires_connection(method: str) -> None:
     """Reject a command when no socket exists."""
 
-    client = SAESSIPPowerClient(SAESSIPPowerSettings("controller"))
+    client = SAESSIPPowerClient(
+        SAESSIPPowerSettings("controller"), access_mode=AccessModeEnum.READ_WRITE
+    )
     with pytest.raises(SAESSIPPowerCommunicationError, match="not connected"):
         getattr(client, method)()
 
@@ -267,10 +273,16 @@ def test_control_send_failure_is_not_retried(result: OSError | int) -> None:
     """Surface failed or incomplete sends without repeating an active command."""
 
     fake_socket = FakeSocket([])
-    send = Mock(side_effect=result) if isinstance(result, OSError) else Mock(return_value=result)
+    send = (
+        Mock(side_effect=result)
+        if isinstance(result, OSError)
+        else Mock(return_value=result)
+    )
     fake_socket.send = send
     client = SAESSIPPowerClient(
-        SAESSIPPowerSettings("controller"), socket_factory=lambda: fake_socket
+        SAESSIPPowerSettings("controller"),
+        access_mode=AccessModeEnum.READ_WRITE,
+        socket_factory=lambda: fake_socket,
     )
     client.connect()
     with pytest.raises(SAESSIPPowerCommunicationError):
@@ -278,34 +290,59 @@ def test_control_send_failure_is_not_retried(result: OSError | int) -> None:
     send.assert_called_once_with(b"\x01\x01")
 
 
-def test_demo_notebook_offline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Execute all demo cells with synthetic settings and a fake UDP socket."""
+def test_demo_jupytext_generation_and_output_preservation(tmp_path: Path) -> None:
+    """Generate a notebook from text alone and keep local outputs on update."""
 
-    notebook = json.loads(
-        (Path(__file__).resolve().parents[1] / "demo.ipynb")
-        .read_text(encoding="utf-8")
+    source = Path(__file__).resolve().parents[1] / "demo.py"
+    text_path = tmp_path / "demo.py"
+    text_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "jupytext",
+        "--to",
+        "ipynb",
+        "--update",
+        str(text_path),
+    ]
+    subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+    notebook_path = text_path.with_suffix(".ipynb")
+    notebook = nbformat.read(notebook_path, as_version=4)
+    code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
+    assert all(cell.execution_count is None and not cell.outputs for cell in code_cells)
+    assert notebook.metadata.jupytext.formats == "ipynb,py:percent"
+    read_cell = next(cell for cell in code_cells if cell.source.startswith("status ="))
+    read_cell.execution_count = 7
+    read_cell.outputs = [
+        nbformat.v4.new_output("stream", name="stdout", text="local run\n")
+    ]
+    nbformat.write(notebook, notebook_path)
+    text_path.write_text(
+        text_path.read_text(encoding="utf-8").replace(
+            "# ## Read current status", "# ## Read current status (updated heading)"
+        ),
+        encoding="utf-8",
     )
-    (tmp_path / "settings.toml").write_text(
-        'host = "controller"\ntimeout_s = 3\n', encoding="utf-8"
+    subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+    updated = nbformat.read(notebook_path, as_version=4)
+    assert any("updated heading" in cell.source for cell in updated.cells)
+    updated_read_cell = next(
+        cell for cell in updated.cells if cell.source.startswith("status =")
     )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    monkeypatch.setattr(time, "sleep", lambda _: None)
-    fake_socket = FakeSocket([read_all_response()] * 12)
-    monkeypatch.setattr(
-        source_module, "SAESSIPPowerClient",
-        lambda settings: SAESSIPPowerClient(settings, socket_factory=lambda: fake_socket),
+    assert updated_read_cell.outputs == read_cell.outputs
+    assert updated_read_cell.execution_count == 7
+    updated.cells[0].source += "\nNotebook-side edit."
+    nbformat.write(updated, notebook_path)
+    subprocess.run(
+        [sys.executable, "-m", "jupytext", "--sync", str(notebook_path)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    namespace: dict[str, object] = {}
-    for cell in notebook["cells"]:
-        if cell["cell_type"] == "code":
-            assert cell["outputs"] == []
-            exec(compile("".join(cell["source"]), "demo.ipynb", "exec"), namespace)
-    assert fake_socket.sent == (
-        [READ_ALL_REQUEST, b"\x01\x01"]
-        + [READ_ALL_REQUEST] * 10
-        + [b"\x01\x02", READ_ALL_REQUEST]
+    assert "Notebook-side edit." in text_path.read_text(encoding="utf-8")
+    synced = nbformat.read(notebook_path, as_version=4)
+    synced_read_cell = next(
+        cell for cell in synced.cells if cell.source.startswith("status =")
     )
-    assert fake_socket.closed
+    assert synced_read_cell.outputs == read_cell.outputs
